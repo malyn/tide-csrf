@@ -87,6 +87,7 @@ use tide::{
 struct CsrfRequestExtData {
     csrf_token: String,
     csrf_header_name: HeaderName,
+    csrf_query_param: String,
 }
 
 /// Provides access to request-level CSRF values.
@@ -98,6 +99,10 @@ pub trait CsrfRequestExt {
     /// Gets the name of the header in which to return the CSRF token,
     /// if the CSRF token is being returned in a header.
     fn csrf_header_name(&self) -> &str;
+
+    /// Gets the name of the query param in which to return the CSRF
+    /// token, if the CSRF token is being returned in a query param.
+    fn csrf_query_param(&self) -> &str;
 }
 
 impl<State> CsrfRequestExt for Request<State>
@@ -117,6 +122,13 @@ where
             .expect("You must install CsrfMiddleware to access the CSRF token.");
         ext_data.csrf_header_name.as_str()
     }
+
+    fn csrf_query_param(&self) -> &str {
+        let ext_data: &CsrfRequestExtData = self
+            .ext()
+            .expect("You must install CsrfMiddleware to access the CSRF token.");
+        ext_data.csrf_query_param.as_str()
+    }
 }
 
 /// Cross-Site Request Forgery (CSRF) protection middleware.
@@ -126,6 +138,7 @@ pub struct CsrfMiddleware {
     cookie_domain: Option<String>,
     ttl: Duration,
     header_name: HeaderName,
+    query_param: String,
     protected_methods: HashSet<Method>,
     protect: AesGcmCsrfProtection,
 }
@@ -138,6 +151,7 @@ impl std::fmt::Debug for CsrfMiddleware {
             .field("cookie_domain", &self.cookie_domain)
             .field("ttl", &self.ttl)
             .field("header_name", &self.header_name)
+            .field("query_param", &self.query_param)
             .field("protected_methods", &self.protected_methods)
             .finish()
     }
@@ -154,6 +168,7 @@ impl CsrfMiddleware {
     /// - cookie domain: None
     /// - ttl: 24 hours
     /// - header name: `X-CSRF-Token`
+    /// - query param: `csrf-token`
     /// - protected methods: `[POST, PUT, PATCH, DELETE]`
     pub fn new(secret: &[u8]) -> Self {
         let mut key = [0u8; 32];
@@ -165,6 +180,7 @@ impl CsrfMiddleware {
             cookie_domain: None,
             ttl: Duration::from_secs(24 * 60 * 60),
             header_name: "X-CSRF-Token".into(),
+            query_param: "csrf-token".into(),
             protected_methods: vec![Method::Post, Method::Put, Method::Patch, Method::Delete]
                 .iter()
                 .cloned()
@@ -189,6 +205,15 @@ impl CsrfMiddleware {
     /// Defaults to "X-CSRF-Token".
     pub fn with_header_name(mut self, header_name: impl AsRef<str>) -> Self {
         self.header_name = header_name.as_ref().into();
+        self
+    }
+
+    /// Sets the name of the query parameter where the middleware will
+    /// look for the CSRF token.
+    ///
+    /// Defaults to "csrf-token".
+    pub fn with_query_param(mut self, query_param: impl AsRef<str>) -> Self {
+        self.query_param = query_param.as_ref().into();
         self
     }
 
@@ -242,14 +267,15 @@ impl CsrfMiddleware {
         State: Clone + Send + Sync + 'static,
     {
         let header_token = self.find_csrf_token_in_header(req);
-
-        // TODO Support finding the token in a query param.
+        let query_token = self.find_csrf_token_in_query(req);
 
         // TODO Support finding the token in POST body, *but* does that cause
         // us to read/consume the body? Need to investigate before we go that
         // route.
 
-        header_token.and_then(|b| self.protect.parse_token(&b).ok())
+        header_token
+            .or(query_token)
+            .and_then(|b| self.protect.parse_token(&b).ok())
     }
 
     fn find_csrf_token_in_header<State>(&self, req: &mut Request<State>) -> Option<Vec<u8>>
@@ -259,6 +285,19 @@ impl CsrfMiddleware {
         req.header(&self.header_name).and_then(|vs| {
             vs.iter()
                 .find_map(|v| BASE64URL.decode(v.as_str().as_bytes()).ok())
+        })
+    }
+
+    fn find_csrf_token_in_query<State>(&self, req: &mut Request<State>) -> Option<Vec<u8>>
+    where
+        State: Clone + Send + Sync + 'static,
+    {
+        req.url().query_pairs().find_map(|(key, value)| {
+            if key == self.query_param {
+                BASE64URL.decode(value.as_bytes()).ok()
+            } else {
+                None
+            }
         })
     }
 }
@@ -311,6 +350,7 @@ where
         req.set_ext(CsrfRequestExtData {
             csrf_token: token.b64_url_string(),
             csrf_header_name: self.header_name.clone(),
+            csrf_query_param: self.query_param.clone(),
         });
 
         // Call the downstream middleware.
@@ -380,7 +420,7 @@ mod tests {
     }
 
     #[async_std::test]
-    async fn middleware_validates_token() -> tide::Result<()> {
+    async fn middleware_validates_token_in_header() -> tide::Result<()> {
         let mut app = tide::new();
         app.with(CsrfMiddleware::new(&SECRET));
 
@@ -428,6 +468,62 @@ mod tests {
             .post("/")
             .header(COOKIE, cookie.to_string())
             .header("X-MyCSRF-Header", csrf_token)
+            .await?;
+        assert_eq!(res.status(), StatusCode::Ok);
+
+        Ok(())
+    }
+
+    #[async_std::test]
+    async fn middleware_validates_token_in_alternate_query() -> tide::Result<()> {
+        // tide::log::with_level(tide::log::LevelFilter::Trace);
+        let mut app = tide::new();
+        app.with(CsrfMiddleware::new(&SECRET).with_query_param("my-csrf-token"));
+
+        app.at("/")
+            .get(|req: Request<()>| async move { Ok(req.csrf_token().to_string()) })
+            .post(|_| async { Ok("POST") });
+
+        let mut res = app.get("/").await?;
+        assert_eq!(res.status(), StatusCode::Ok);
+        let csrf_token = res.body_string().await?;
+        let cookie = get_csrf_cookie(&res).expect("Expected CSRF cookie in response.");
+        assert_eq!(cookie.name(), "tide.csrf");
+
+        let res = app.post("/").await?;
+        assert_eq!(res.status(), StatusCode::Forbidden);
+
+        let res = app
+            .post(format!("/?a=1&my-csrf-token={}&b=2", csrf_token))
+            .header(COOKIE, cookie.to_string())
+            .await?;
+        assert_eq!(res.status(), StatusCode::Ok);
+
+        Ok(())
+    }
+
+    #[async_std::test]
+    async fn middleware_validates_token_in_query() -> tide::Result<()> {
+        // tide::log::with_level(tide::log::LevelFilter::Trace);
+        let mut app = tide::new();
+        app.with(CsrfMiddleware::new(&SECRET));
+
+        app.at("/")
+            .get(|req: Request<()>| async move { Ok(req.csrf_token().to_string()) })
+            .post(|_| async { Ok("POST") });
+
+        let mut res = app.get("/").await?;
+        assert_eq!(res.status(), StatusCode::Ok);
+        let csrf_token = res.body_string().await?;
+        let cookie = get_csrf_cookie(&res).expect("Expected CSRF cookie in response.");
+        assert_eq!(cookie.name(), "tide.csrf");
+
+        let res = app.post("/").await?;
+        assert_eq!(res.status(), StatusCode::Forbidden);
+
+        let res = app
+            .post(format!("/?a=1&csrf-token={}&b=2", csrf_token))
+            .header(COOKIE, cookie.to_string())
             .await?;
         assert_eq!(res.status(), StatusCode::Ok);
 

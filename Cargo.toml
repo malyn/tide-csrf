@@ -19,4 +19,5 @@ tide = { version = "0.16.0", default-features = false, features = ["cookies"] }
 
 [dev-dependencies]
 async-std = { version = "1.9.0", features = ["attributes"] }
+tide = "0.16.0"
 tide-testing = "0.1"
