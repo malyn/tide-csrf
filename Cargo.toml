@@ -1,0 +1,22 @@
+[package]
+name = "tide-csrf"
+version = "0.1.0"
+authors = ["Michael Alyn Miller <malyn@strangeGizmo.com>"]
+description = "Cross-Site Request Forgery (CSRF) protection middleware for Tide"
+keywords = ["tide", "csrf", "security"]
+categories = ["web-programming", "web-programming::http-server"]
+edition = "2018"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/malyn/tide-csrf"
+
+[dependencies]
+csrf = "0.4.0"
+data-encoding = "2.0.0"
+hkdf = "0.11.0"
+sha2 = "0.9.0"
+tide = { version = "0.16.0", default-features = false, features = ["cookies"] }
+
+[dev-dependencies]
+async-std = { version = "1.9.0", features = ["attributes"] }
+tide-testing = "0.1"
