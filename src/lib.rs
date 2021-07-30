@@ -79,9 +79,9 @@ use csrf::{
 };
 use data_encoding::{BASE64, BASE64URL};
 use tide::{
-    http::cookies::SameSite,
+    http::{cookies::SameSite, mime},
     http::{headers::HeaderName, Cookie, Method},
-    Middleware, Next, Request, Response, StatusCode,
+    Body, Middleware, Next, Request, Response, StatusCode,
 };
 
 struct CsrfRequestExtData {
@@ -139,6 +139,7 @@ pub struct CsrfMiddleware {
     ttl: Duration,
     header_name: HeaderName,
     query_param: String,
+    form_field: String,
     protected_methods: HashSet<Method>,
     protect: AesGcmCsrfProtection,
 }
@@ -152,6 +153,7 @@ impl std::fmt::Debug for CsrfMiddleware {
             .field("ttl", &self.ttl)
             .field("header_name", &self.header_name)
             .field("query_param", &self.query_param)
+            .field("form_field", &self.form_field)
             .field("protected_methods", &self.protected_methods)
             .finish()
     }
@@ -169,6 +171,7 @@ impl CsrfMiddleware {
     /// - ttl: 24 hours
     /// - header name: `X-CSRF-Token`
     /// - query param: `csrf-token`
+    /// - form field: `csrf-token`
     /// - protected methods: `[POST, PUT, PATCH, DELETE]`
     pub fn new(secret: &[u8]) -> Self {
         let mut key = [0u8; 32];
@@ -181,6 +184,7 @@ impl CsrfMiddleware {
             ttl: Duration::from_secs(24 * 60 * 60),
             header_name: "X-CSRF-Token".into(),
             query_param: "csrf-token".into(),
+            form_field: "csrf-token".into(),
             protected_methods: vec![Method::Post, Method::Put, Method::Patch, Method::Delete]
                 .iter()
                 .cloned()
@@ -214,6 +218,15 @@ impl CsrfMiddleware {
     /// Defaults to "csrf-token".
     pub fn with_query_param(mut self, query_param: impl AsRef<str>) -> Self {
         self.query_param = query_param.as_ref().into();
+        self
+    }
+
+    /// Sets the name of the form field where the middleware will look
+    /// for the CSRF token.
+    ///
+    /// Defaults to "csrf-token".
+    pub fn with_form_field(mut self, form_field: impl AsRef<str>) -> Self {
+        self.form_field = form_field.as_ref().into();
         self
     }
 
@@ -253,7 +266,7 @@ impl CsrfMiddleware {
             .expect("couldn't generate token/cookie pair")
     }
 
-    fn find_csrf_cookie<State>(&self, req: &mut Request<State>) -> Option<UnencryptedCsrfCookie>
+    fn find_csrf_cookie<State>(&self, req: &Request<State>) -> Option<UnencryptedCsrfCookie>
     where
         State: Clone + Send + Sync + 'static,
     {
@@ -262,23 +275,32 @@ impl CsrfMiddleware {
             .and_then(|b| self.protect.parse_cookie(&b).ok())
     }
 
-    fn find_csrf_token<State>(&self, req: &mut Request<State>) -> Option<UnencryptedCsrfToken>
+    async fn find_csrf_token<State>(
+        &self,
+        req: &mut Request<State>,
+    ) -> Result<Option<UnencryptedCsrfToken>, tide::Error>
     where
         State: Clone + Send + Sync + 'static,
     {
-        let header_token = self.find_csrf_token_in_header(req);
-        let query_token = self.find_csrf_token_in_query(req);
+        // A bit of a strange flow here (with an early exit as well),
+        // because we do not want to do the expensive parsing (form,
+        // body specifically) if we find a CSRF token in an earlier
+        // location. And we can't use `or_else` chaining since the
+        // function that searches through the form body is async.
+        let csrf_token = if let Some(csrf_token) = self.find_csrf_token_in_header(req) {
+            csrf_token
+        } else if let Some(csrf_token) = self.find_csrf_token_in_query(req) {
+            csrf_token
+        } else if let Some(csrf_token) = self.find_csrf_token_in_form(req).await? {
+            csrf_token
+        } else {
+            return Ok(None);
+        };
 
-        // TODO Support finding the token in POST body, *but* does that cause
-        // us to read/consume the body? Need to investigate before we go that
-        // route.
-
-        header_token
-            .or(query_token)
-            .and_then(|b| self.protect.parse_token(&b).ok())
+        Ok(Some(self.protect.parse_token(&csrf_token)?))
     }
 
-    fn find_csrf_token_in_header<State>(&self, req: &mut Request<State>) -> Option<Vec<u8>>
+    fn find_csrf_token_in_header<State>(&self, req: &Request<State>) -> Option<Vec<u8>>
     where
         State: Clone + Send + Sync + 'static,
     {
@@ -288,7 +310,7 @@ impl CsrfMiddleware {
         })
     }
 
-    fn find_csrf_token_in_query<State>(&self, req: &mut Request<State>) -> Option<Vec<u8>>
+    fn find_csrf_token_in_query<State>(&self, req: &Request<State>) -> Option<Vec<u8>>
     where
         State: Clone + Send + Sync + 'static,
     {
@@ -300,6 +322,58 @@ impl CsrfMiddleware {
             }
         })
     }
+
+    async fn find_csrf_token_in_form<State>(
+        &self,
+        req: &mut Request<State>,
+    ) -> Result<Option<Vec<u8>>, tide::Error>
+    where
+        State: Clone + Send + Sync + 'static,
+    {
+        // We only try to look for the CSRF token in a form field if the
+        // body is in fact a form.
+        if req.content_type() != Some(mime::FORM) {
+            return Ok(None);
+        }
+
+        // Get a copy of the body as a byte array. Note that the request
+        // is essentially unusable if this fails and we return an error
+        // (since the body has been taken and not replaced).
+        let body = req.take_body().into_bytes().await?;
+
+        // Try to find the CSRF token. This could fail for multiple
+        // reasons (such as an inability to parse the body as a form
+        // body), but we convert all of those failures to a `None`
+        // result since we do not want to block the request at this
+        // point. The caller will decide if/how to block the request
+        // based on missing/mismatched CSRF tokens. This is unlike what
+        // happens if we cannot read the body at all (above), where our
+        // only option is to completely fail the request.
+        //
+        // Note that an important subtlety in this function is that we
+        // *must* put the body back after we try to find the CSRF token,
+        // so we cannot fail directly out of this decoding step, but
+        // must instead compute the result, put the body back into the
+        // request, then return whatever resulted was computed.
+        let csrf_token = serde_urlencoded::from_bytes::<Vec<(String, String)>>(&body)
+            .unwrap_or_default()
+            .into_iter()
+            .find_map(|(key, value)| {
+                if key == self.form_field {
+                    BASE64URL.decode(value.as_bytes()).ok()
+                } else {
+                    None
+                }
+            });
+
+        // Put a new body, backed by our copied byte array, into the
+        // request.
+        req.set_body(Body::from_bytes(body));
+
+        // Return the CSRF token (which may be None, if we didn't actually
+        // find a CSRF token in the form).
+        Ok(csrf_token)
+    }
 }
 
 #[tide::utils::async_trait]
@@ -308,9 +382,16 @@ where
     State: Clone + Send + Sync + 'static,
 {
     async fn handle(&self, mut req: Request<State>, next: Next<'_, State>) -> tide::Result {
+        // TODO Do the protected methods check first before we even
+        // bother to look at the cookies and request.
+
+        // TODO After the protected methods check, get the cookie first
+        // and do not even bother looking for the token if the cookie is
+        // not present.
+
         // Extract the existing CSRF token and cookie.
-        let existing_token = self.find_csrf_token(&mut req);
-        let existing_cookie = self.find_csrf_cookie(&mut req);
+        let existing_token = self.find_csrf_token(&mut req).await?;
+        let existing_cookie = self.find_csrf_cookie(&req);
         tide::log::trace!(
             "Existing token: {:?}; existing cookie: {:?}",
             existing_token,
@@ -437,12 +518,13 @@ mod tests {
         let res = app.post("/").await?;
         assert_eq!(res.status(), StatusCode::Forbidden);
 
-        let res = app
+        let mut res = app
             .post("/")
             .header(COOKIE, cookie.to_string())
             .header("X-CSRF-Token", csrf_token)
             .await?;
         assert_eq!(res.status(), StatusCode::Ok);
+        assert_eq!(res.body_string().await?, "POST");
 
         Ok(())
     }
@@ -464,12 +546,13 @@ mod tests {
         let csrf_token = res.body_string().await?;
         let cookie = get_csrf_cookie(&res).expect("Expected CSRF cookie in response.");
 
-        let res = app
+        let mut res = app
             .post("/")
             .header(COOKIE, cookie.to_string())
             .header("X-MyCSRF-Header", csrf_token)
             .await?;
         assert_eq!(res.status(), StatusCode::Ok);
+        assert_eq!(res.body_string().await?, "POST");
 
         Ok(())
     }
@@ -493,11 +576,12 @@ mod tests {
         let res = app.post("/").await?;
         assert_eq!(res.status(), StatusCode::Forbidden);
 
-        let res = app
+        let mut res = app
             .post(format!("/?a=1&my-csrf-token={}&b=2", csrf_token))
             .header(COOKIE, cookie.to_string())
             .await?;
         assert_eq!(res.status(), StatusCode::Ok);
+        assert_eq!(res.body_string().await?, "POST");
 
         Ok(())
     }
@@ -521,17 +605,68 @@ mod tests {
         let res = app.post("/").await?;
         assert_eq!(res.status(), StatusCode::Forbidden);
 
-        let res = app
+        let mut res = app
             .post(format!("/?a=1&csrf-token={}&b=2", csrf_token))
             .header(COOKIE, cookie.to_string())
             .await?;
         assert_eq!(res.status(), StatusCode::Ok);
+        assert_eq!(res.body_string().await?, "POST");
 
         Ok(())
     }
 
-    // TODO Create some tests that show/verify how newer cookies can
-    // be used with older tokens (and vice versa).
+    #[async_std::test]
+    async fn middleware_validates_token_in_form() -> tide::Result<()> {
+        // tide::log::with_level(tide::log::LevelFilter::Trace);
+        let mut app = tide::new();
+        app.with(CsrfMiddleware::new(&SECRET));
+
+        app.at("/")
+            .get(|req: Request<()>| async move { Ok(req.csrf_token().to_string()) })
+            .post(|mut req: Request<()>| async move {
+                // Deserialize our part of the form in order to verify that
+                // the CsrfMiddleware does not break form parsing since it
+                // also had to parse the form in order to find its CSRF field.
+                #[derive(serde::Deserialize)]
+                struct Form {
+                    a: String,
+                    b: i32,
+                }
+                let form: Form = req.body_form().await?;
+                assert_eq!(form.a, "1");
+                assert_eq!(form.b, 2);
+
+                Ok("POST")
+            });
+
+        let mut res = app.get("/").await?;
+        assert_eq!(res.status(), StatusCode::Ok);
+        let csrf_token = res.body_string().await?;
+        let cookie = get_csrf_cookie(&res).expect("Expected CSRF cookie in response.");
+        assert_eq!(cookie.name(), "tide.csrf");
+
+        let res = app.post("/").await?;
+        assert_eq!(res.status(), StatusCode::Forbidden);
+
+        let mut res = app
+            .post("/")
+            .header(COOKIE, cookie.to_string())
+            .content_type("application/x-www-form-urlencoded")
+            .body(format!("a=1&csrf-token={}&b=2", csrf_token))
+            .await?;
+        assert_eq!(res.status(), StatusCode::Ok);
+        assert_eq!(res.body_string().await?, "POST");
+
+        Ok(())
+    }
+
+    // TODO Verify that the form searching ignores non-form bodies.
+
+    // TODO Create some tests that show/verify how newer cookies can be
+    // used with older tokens (and vice versa).
+
+    // TODO Create some tests that use corrupt tokens, form bodies, etc.
+    // and verify that we get reasonable (HTTP) errors.
 
     fn get_csrf_cookie(res: &Response) -> Option<Cookie> {
         if let Some(values) = res.header(SET_COOKIE) {
