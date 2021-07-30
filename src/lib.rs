@@ -286,7 +286,11 @@ impl CsrfMiddleware {
         // because we do not want to do the expensive parsing (form,
         // body specifically) if we find a CSRF token in an earlier
         // location. And we can't use `or_else` chaining since the
-        // function that searches through the form body is async.
+        // function that searches through the form body is async. Note
+        // that if parsing the body fails then we want to return an
+        // InternalServerError, hence the `?`. This is not the same as
+        // what we will do later, which is convert failures to *parse* a
+        // found CSRF token into Forbidden responses.
         let csrf_token = if let Some(csrf_token) = self.find_csrf_token_in_header(req) {
             csrf_token
         } else if let Some(csrf_token) = self.find_csrf_token_in_query(req) {
@@ -297,7 +301,9 @@ impl CsrfMiddleware {
             return Ok(None);
         };
 
-        Ok(Some(self.protect.parse_token(&csrf_token)?))
+        Ok(Some(self.protect.parse_token(&csrf_token).map_err(
+            |err| tide::Error::new(StatusCode::Forbidden, err),
+        )?))
     }
 
     fn find_csrf_token_in_header<State>(&self, req: &Request<State>) -> Option<Vec<u8>>
@@ -660,13 +666,199 @@ mod tests {
         Ok(())
     }
 
-    // TODO Verify that the form searching ignores non-form bodies.
+    #[async_std::test]
+    async fn middleware_ignores_non_form_bodies() -> tide::Result<()> {
+        // tide::log::with_level(tide::log::LevelFilter::Trace);
+        let mut app = tide::new();
+        app.with(CsrfMiddleware::new(&SECRET));
 
-    // TODO Create some tests that show/verify how newer cookies can be
-    // used with older tokens (and vice versa).
+        app.at("/")
+            .get(|req: Request<()>| async move { Ok(req.csrf_token().to_string()) })
+            .post(|_| async { Ok("POST") });
 
-    // TODO Create some tests that use corrupt tokens, form bodies, etc.
-    // and verify that we get reasonable (HTTP) errors.
+        let mut res = app.get("/").await?;
+        assert_eq!(res.status(), StatusCode::Ok);
+        let csrf_token = res.body_string().await?;
+        let cookie = get_csrf_cookie(&res).expect("Expected CSRF cookie in response.");
+        assert_eq!(cookie.name(), "tide.csrf");
+
+        let res = app.post("/").await?;
+        assert_eq!(res.status(), StatusCode::Forbidden);
+
+        // Include the CSRF token in what *looks* like a form body, but
+        // the Content-Type is `text/html` and so the middleware will
+        // ignore the body.
+        let res = app
+            .post("/")
+            .header(COOKIE, cookie.to_string())
+            .content_type("text/html")
+            .body(format!("a=1&csrf-token={}&b=2", csrf_token))
+            .await?;
+        assert_eq!(res.status(), StatusCode::Forbidden);
+
+        Ok(())
+    }
+
+    #[async_std::test]
+    async fn middleware_allows_different_generation_cookies_and_tokens() -> tide::Result<()> {
+        let mut app = tide::new();
+        app.with(CsrfMiddleware::new(&SECRET));
+
+        app.at("/")
+            .get(|req: Request<()>| async move { Ok(req.csrf_token().to_string()) })
+            .post(|req: Request<()>| async move { Ok(req.csrf_token().to_string()) });
+
+        let mut res = app.get("/").await?;
+        assert_eq!(res.status(), StatusCode::Ok);
+        let csrf_token = res.body_string().await?;
+        let cookie = get_csrf_cookie(&res).expect("Expected CSRF cookie in response.");
+        assert_eq!(cookie.name(), "tide.csrf");
+
+        let res = app.post("/").await?;
+        assert_eq!(res.status(), StatusCode::Forbidden);
+
+        // Send a valid CSRF token and verify that we get back a
+        // *different* token *and* cookie (which is how the `csrf` crate
+        // works; each response generates a different token and cookie,
+        // but all related -- part of the same request/response flow --
+        // tokens and cookies are compatible with each other until they
+        // expire).
+        let mut res = app
+            .post("/")
+            .header(COOKIE, cookie.to_string())
+            .header("X-CSRF-Token", &csrf_token)
+            .await?;
+        assert_eq!(res.status(), StatusCode::Ok);
+        let new_csrf_token = res.body_string().await?;
+        assert_ne!(new_csrf_token, csrf_token);
+        let new_cookie = get_csrf_cookie(&res).expect("Expected CSRF cookie in response.");
+        assert_eq!(new_cookie.name(), "tide.csrf");
+        assert_ne!(new_cookie.to_string(), cookie.to_string());
+
+        // Now send another request with the *first* token and the
+        // *second* cookie and verify that the older token still works.
+        // (because the token hasn't expired yet, and all unexpired
+        // tokens are compatible with all related cookies).
+        let res = app
+            .post("/")
+            .header(COOKIE, new_cookie.to_string())
+            .header("X-CSRF-Token", csrf_token)
+            .await?;
+        assert_eq!(res.status(), StatusCode::Ok);
+
+        // Finally, one more check that does the opposite of what we
+        // just did: a new token with an old cookie.
+        let res = app
+            .post("/")
+            .header(COOKIE, cookie.to_string())
+            .header("X-CSRF-Token", new_csrf_token)
+            .await?;
+        assert_eq!(res.status(), StatusCode::Ok);
+
+        Ok(())
+    }
+
+    #[async_std::test]
+    async fn middleware_rejects_short_token() -> tide::Result<()> {
+        // tide::log::with_level(tide::log::LevelFilter::Trace);
+        let mut app = tide::new();
+        app.with(CsrfMiddleware::new(&SECRET));
+
+        app.at("/")
+            .get(|req: Request<()>| async move { Ok(req.csrf_token().to_string()) })
+            .post(|_| async { Ok("POST") });
+
+        let res = app.get("/").await?;
+        assert_eq!(res.status(), StatusCode::Ok);
+        let cookie = get_csrf_cookie(&res).expect("Expected CSRF cookie in response.");
+        assert_eq!(cookie.name(), "tide.csrf");
+
+        let res = app.post("/").await?;
+        assert_eq!(res.status(), StatusCode::Forbidden);
+
+        // Send a CSRF token that is not a token (instead, it is the
+        // Base64 string "hello") and verify that we get a Forbidden
+        // response (and not a server error or anything like that, since
+        // the server is operating fine, it is the request that we are
+        // rejecting).
+        let res = app
+            .post("/")
+            .header(COOKIE, cookie.to_string())
+            .header("X-CSRF-Token", "aGVsbG8=")
+            .await?;
+        assert_eq!(res.status(), StatusCode::Forbidden);
+
+        Ok(())
+    }
+
+    #[async_std::test]
+    async fn middleware_rejects_invalid_base64_token() -> tide::Result<()> {
+        // tide::log::with_level(tide::log::LevelFilter::Trace);
+        let mut app = tide::new();
+        app.with(CsrfMiddleware::new(&SECRET));
+
+        app.at("/")
+            .get(|req: Request<()>| async move { Ok(req.csrf_token().to_string()) })
+            .post(|_| async { Ok("POST") });
+
+        let res = app.get("/").await?;
+        assert_eq!(res.status(), StatusCode::Ok);
+        let cookie = get_csrf_cookie(&res).expect("Expected CSRF cookie in response.");
+        assert_eq!(cookie.name(), "tide.csrf");
+
+        let res = app.post("/").await?;
+        assert_eq!(res.status(), StatusCode::Forbidden);
+
+        // Send a corrupt Base64 string as the CSRF token and verify
+        // that we get a Forbidden response (and not a server error or
+        // anything like that, since the server is operating fine, it is
+        // the request that we are rejecting).
+        let res = app
+            .post("/")
+            .header(COOKIE, cookie.to_string())
+            .header("X-CSRF-Token", "aGVsbG8")
+            .await?;
+        assert_eq!(res.status(), StatusCode::Forbidden);
+
+        Ok(())
+    }
+
+    #[async_std::test]
+    async fn middleware_rejects_mismatched_token() -> tide::Result<()> {
+        let mut app = tide::new();
+        app.with(CsrfMiddleware::new(&SECRET));
+
+        app.at("/")
+            .get(|req: Request<()>| async move { Ok(req.csrf_token().to_string()) })
+            .post(|_| async { Ok("POST") });
+
+        // Make two requests, keep the token from the first and the
+        // cookie from the second. This ensures that we have a
+        // validly-formatted token, but one that will be rejected if
+        // provided with the wrong cookie.
+        let mut res = app.get("/").await?;
+        assert_eq!(res.status(), StatusCode::Ok);
+        let csrf_token = res.body_string().await?;
+
+        let res = app.get("/").await?;
+        assert_eq!(res.status(), StatusCode::Ok);
+        let cookie = get_csrf_cookie(&res).expect("Expected CSRF cookie in response.");
+        assert_eq!(cookie.name(), "tide.csrf");
+
+        let res = app.post("/").await?;
+        assert_eq!(res.status(), StatusCode::Forbidden);
+
+        // Send a valid (but mismatched) CSRF token and verify that we
+        // get a Forbidden response.
+        let res = app
+            .post("/")
+            .header(COOKIE, cookie.to_string())
+            .header("X-CSRF-Token", csrf_token)
+            .await?;
+        assert_eq!(res.status(), StatusCode::Forbidden);
+
+        Ok(())
+    }
 
     fn get_csrf_cookie(res: &Response) -> Option<Cookie> {
         if let Some(values) = res.header(SET_COOKIE) {

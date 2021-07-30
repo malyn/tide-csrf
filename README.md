@@ -21,6 +21,11 @@ Add this to your `Cargo.toml`:
 tide-csrf = "0.1"
 ```
 
+## Performance Considerations
+
+TODO Explain the performance impact of putting the CSRF token in the
+header vs. query params vs. forms.
+
 ## Examples
 
 TODO
