@@ -88,6 +88,7 @@ struct CsrfRequestExtData {
     csrf_token: String,
     csrf_header_name: HeaderName,
     csrf_query_param: String,
+    csrf_field_name: String,
 }
 
 /// Provides access to request-level CSRF values.
@@ -103,6 +104,10 @@ pub trait CsrfRequestExt {
     /// Gets the name of the query param in which to return the CSRF
     /// token, if the CSRF token is being returned in a query param.
     fn csrf_query_param(&self) -> &str;
+
+    /// Gets the name of the form field in which to return the CSRF
+    /// token, if the CSRF token is being returned in a form field.
+    fn csrf_field_name(&self) -> &str;
 }
 
 impl<State> CsrfRequestExt for Request<State>
@@ -128,6 +133,13 @@ where
             .ext()
             .expect("You must install CsrfMiddleware to access the CSRF token.");
         ext_data.csrf_query_param.as_str()
+    }
+
+    fn csrf_field_name(&self) -> &str {
+        let ext_data: &CsrfRequestExtData = self
+            .ext()
+            .expect("You must install CsrfMiddleware to access the CSRF token.");
+        ext_data.csrf_field_name.as_str()
     }
 }
 
@@ -429,6 +441,7 @@ where
             csrf_token: token.b64_url_string(),
             csrf_header_name: self.header_name.clone(),
             csrf_query_param: self.query_param.clone(),
+            csrf_field_name: self.form_field.clone(),
         });
 
         // Call the downstream middleware.
