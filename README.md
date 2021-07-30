@@ -21,14 +21,21 @@ Add this to your `Cargo.toml`:
 tide-csrf = "0.1"
 ```
 
-## Performance Considerations
+## Protected Methods
 
-TODO Explain the performance impact of putting the CSRF token in the
-header vs. query params vs. forms.
+TODO Explain the concept of protected methods (and the middleware's
+defaults) and that, by default, you must not mutate in `GET`! And if you
+do, you have to add `GET` to your protected methods (which is a bit
+expensive, so ideally do not do that).
 
 ## Examples
 
 TODO
+
+## Performance Considerations
+
+TODO Explain the performance impact of putting the CSRF token in the
+header vs. query params vs. forms.
 
 ## Conduct
 

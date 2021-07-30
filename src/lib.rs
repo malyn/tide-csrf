@@ -388,48 +388,39 @@ where
     State: Clone + Send + Sync + 'static,
 {
     async fn handle(&self, mut req: Request<State>, next: Next<'_, State>) -> tide::Result {
-        // TODO Do the protected methods check first before we even
-        // bother to look at the cookies and request.
-
-        // TODO After the protected methods check, get the cookie first
-        // and do not even bother looking for the token if the cookie is
-        // not present.
-
-        // Extract the existing CSRF token and cookie.
-        let existing_token = self.find_csrf_token(&mut req).await?;
+        // We always begin by trying to find the existing CSRF cookie,
+        // even if we do not need to protect this method. A new token is
+        // generated on every request *based on the encrypted key in the
+        // cookie* and so we always want to find the existing cookie in
+        // order to generate a token that uses the same underlying key.
         let existing_cookie = self.find_csrf_cookie(&req);
-        tide::log::trace!(
-            "Existing token: {:?}; existing cookie: {:?}",
-            existing_token,
-            existing_cookie
-        );
 
-        // Is this a protected method? If so, verify the token.
+        // Is this a protected method? If so, we need to find the token
+        // and verify it against the cookie before we can allow the
+        // request.
         if self.protected_methods.contains(&req.method()) {
-            match (existing_token, existing_cookie.as_ref()) {
-                (Some(token), Some(cookie)) => {
+            if let Some(cookie) = &existing_cookie {
+                if let Some(token) = self.find_csrf_token(&mut req).await? {
                     if self.protect.verify_token_pair(&token, cookie) {
-                        tide::log::debug!(
-                            "Verified CSRF token when calling protected method {:?}",
-                            req.method()
-                        );
+                        tide::log::debug!("Verified CSRF token.");
                     } else {
-                        tide::log::debug!("Rejecting request for protected method {:?} due to invalid or expired CSRF token.", req.method());
+                        tide::log::debug!(
+                            "Rejecting request due to invalid or expired CSRF token."
+                        );
                         return Ok(Response::new(StatusCode::Forbidden));
                     }
-                }
-                _ => {
-                    tide::log::debug!(
-                        "Rejecting request for protected method {:?} due to missing CSRF token.",
-                        req.method()
-                    );
+                } else {
+                    tide::log::debug!("Rejecting request due to missing CSRF token.",);
                     return Ok(Response::new(StatusCode::Forbidden));
                 }
+            } else {
+                tide::log::debug!("Rejecting request due to missing CSRF cookie.",);
+                return Ok(Response::new(StatusCode::Forbidden));
             }
         }
 
-        // Generate a new cookie and token (using the existing inner
-        // token data if present).
+        // Generate a new cookie and token (using the existing cookie if
+        // present).
         let (token, cookie) = self.generate_token(existing_cookie.as_ref());
 
         // Add the token to the request for use by the application.
