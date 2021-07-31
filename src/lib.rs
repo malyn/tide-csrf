@@ -1,39 +1,61 @@
 //! Cross-Site Request Forgery (CSRF) protection middleware for Tide.
 //!
 //! This crate provides middleware that helps you defend against CSRF
-//! attacks. The middleware generates a CSRF cookie, adds it to your
-//! response, and generates a CSRF token and makes it available to your
-//! request. You can then add the CSRF token to your HTML in subsequent
-//! request headers, query parameters, or form fields. The middleware
-//! then verifies that the CSRF token matches the cookie, both of which
-//! must be present and correct for all protected methods (by default,
+//! attacks. The middleware generates a CSRF cookie and adds it to your
+//! Tide response, and then generates a CSRF token and makes it
+//! available to your Tide request. In your HTML, you then arrange for
+//! the CSRF token to be returned to the server on subsequent requests,
+//! either in a request header, a query parameter, or a form field. The
+//! middleware then verifies that a CSRF token is present and valid
+//! whenever a request is received for a protected method (by default,
 //! `POST`, `PUT`, `PATCH`, and `DELETE`).
 //!
-//! ## Implementation Details
+//! ## Protected Methods
 //!
-//! As an aside, here is how this works: the cookie and CSRF token
-//! inserted in the page change on every request, but the token that is
-//! encrypted into those things remains the same *as long as we flow
-//! through the `previous_token_value`*. That allows us to use older
-//! CSRF tokens with newer cookies (and vice versa), since they all
-//! contain the same internal token value.
+//! By default, this middleware protects only those HTTP methods that
+//! might mutate state on the server. Those "unsafe" methods are `POST`,
+//! `PUT`, `PATCH`, and `DELETE`. The remaining methods -- `GET`,
+//! `HEAD`, etc. -- are *not* protected by default. This limits the
+//! performance impact of the middleware on your application.
 //!
-//! This is different than how ring-anti-forgery works, for example,
-//! because it requires you to *also* have a session store, which is
-//! where it stashes an *unencrypted* token. That exact token is the
-//! CSRF token that is put into the request and compared as-is on every
-//! request.
+//! However, if your application *does* mutate state in those "safe"
+//! methods then you need to [set the list of protected
+//! methods](CsrfMiddleware::with_protected_methods) to include those
+//! other methods.
 //!
-//! The Rust csrf crate that we use here does not require session
-//! storage. Instead, it just sends *two* tokens down to the browser:
-//! one in an encrypted cookie, and another in an encrypted CSRF token.
-//! Those two values must be returned on every call to the browser and
-//! are decrypted in order to compare their internal token value. Both
-//! the (encrypted) cookie and the (encrypted) token include a nonce, so
-//! they will be different on every single web response, but, because
-//! they contain the same *internal* CSRF token, any two tokens and
-//! cookies can be compared against each other as equal (as long as the
-//! cookie has not expired).
+//! Note that protecting `GET` may create a "chicken and egg" situation
+//! where you have no way to return the CSRF cookie and token to a
+//! caller for them to return back to you in a subsequent request! In
+//! general, the default list of methods is the correct one and you
+//! should ensure that the "safe" methods are in fact truly safe and do
+//! not perform any mutations.
+//!
+//! ## Performance Considerations
+//!
+//! This middleware adds a CSRF cookie to every request and looks for a
+//! match CSRF token when processing a request for a protected method.
+//! The CSRF token can be returned in an HTTP header, the URL query
+//! string, or an `application/x-www-form-urlencoded` form body. The
+//! token is searched for in that order and the search will be
+//! terminated as soon as the token is found.
+//!
+//! The most efficient place to search for the token is in an HTTP
+//! header and that mechanism should be preferred if you have the
+//! ability to set headers in the request. The query string is a good
+//! option if you cannot set HTTP headers.
+//!
+//! Using form fields is the least efficient way to return the CSRF
+//! token because the middleware has to read and deserialize the entire
+//! request body in order to see if the token is present. This is
+//! particularly unfortunate in Tide, which otherwise treats all bodies
+//! as streaming bodies instead of fully-materialized byte arrays.
+//!
+//! For this reason, the middleware searches the form fields last *and*
+//! only considers `application/x-www-form-urlencoded` requests;
+//! `multipart/form-data` bodies, which may contain large, binary
+//! payloads, are *not* searched. If you need to protect
+//! `multipart/form-data` requests then you should return the CSRF token
+//! in an HTTP header or the query string.
 //!
 //! ## Example
 //!
@@ -47,12 +69,27 @@
 //!     b"we recommend you use std::env::var(\"TIDE_SECRET\").unwrap().as_bytes() instead of a fixed value"
 //! ));
 //!
+//! // This is an unprotected method and does not require a CSRF token
+//! // (but will set the CSRF cookie).
 //! app.at("/").get(|req: tide::Request<()>| async move {
-//!     Ok(format!(
-//!         "CSRF token is {}; you should put that in header {}",
-//!         req.csrf_token(),
-//!         req.csrf_header_name()
-//!     ))
+//!    // Note that here we are simply returning the token in a string, but
+//!    // in a real application you need to arrange for the token to appear
+//!    // in the request to the server.
+//!    Ok(format!(
+//!        "CSRF token is {}; you should return that in header {}, or query param {}, or a form field named {}",
+//!        req.csrf_token(),
+//!        req.csrf_header_name(),
+//!        req.csrf_query_param(),
+//!        req.csrf_field_name()
+//!    ))
+//! });
+//!
+//! // This is a protected method and will only allow the request to
+//! // make it to the handler if the CSRF token is present in the
+//! // request. Otherwise an HTTP status of `Forbidden` will be
+//! // returned and the handler will *not* be called.
+//! app.at("/").post(|req: tide::Request<()>| async move {
+//!    Ok("Getting this far means that the CSRF token was present in the request.")
 //! });
 //!
 //! # })
@@ -239,6 +276,15 @@ impl CsrfMiddleware {
     /// Defaults to "csrf-token".
     pub fn with_form_field(mut self, form_field: impl AsRef<str>) -> Self {
         self.form_field = form_field.as_ref().into();
+        self
+    }
+
+    /// Sets the list of methods that will be protected by this
+    /// middleware
+    ///
+    /// Defaults to `[POST, PUT, PATCH, DELETE]`
+    pub fn with_protected_methods(mut self, methods: &[Method]) -> Self {
+        self.protected_methods = methods.iter().cloned().collect();
         self
     }
 

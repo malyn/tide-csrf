@@ -21,21 +21,40 @@ Add this to your `Cargo.toml`:
 tide-csrf = "0.1"
 ```
 
-## Protected Methods
-
-TODO Explain the concept of protected methods (and the middleware's
-defaults) and that, by default, you must not mutate in `GET`! And if you
-do, you have to add `GET` to your protected methods (which is a bit
-expensive, so ideally do not do that).
-
 ## Examples
 
-TODO
+```rust
+use tide_csrf::{self, CsrfRequestExt};
 
-## Performance Considerations
+let mut app = tide::new();
 
-TODO Explain the performance impact of putting the CSRF token in the
-header vs. query params vs. forms.
+app.with(tide_csrf::CsrfMiddleware::new(
+    b"we recommend you use std::env::var(\"TIDE_SECRET\").unwrap().as_bytes() instead of a fixed value"
+));
+
+// This is an unprotected method and does not require a CSRF token
+// (but will set the CSRF cookie).
+app.at("/").get(|req: tide::Request<()>| async move {
+    // Note that here we are simply returning the token in a string, but
+    // in a real application you need to arrange for the token to appear
+    // in the request to the server.
+    Ok(format!(
+        "CSRF token is {}; you should return that in header {}, or query param {}, or a form field named {}",
+        req.csrf_token(),
+        req.csrf_header_name(),
+        req.csrf_query_param(),
+        req.csrf_field_name()
+    ))
+});
+
+// This is a protected method and will only allow the request to
+// make it to the handler if the CSRF token is present in the
+// request. Otherwise an HTTP status of `Forbidden` will be
+// returned and the handler will *not* be called.
+app.at("/").post(|req: tide::Request<()>| async move {
+   Ok("Getting this far means that the CSRF token was present in the request.")
+});
+```
 
 ## Conduct
 
