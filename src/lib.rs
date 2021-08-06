@@ -7,8 +7,7 @@
 //! the CSRF token to be returned to the server on subsequent requests,
 //! either in a request header, a query parameter, or a form field. The
 //! middleware then verifies that a CSRF token is present and valid
-//! whenever a request is received for a protected method (by default,
-//! `POST`, `PUT`, `PATCH`, and `DELETE`).
+//! whenever a request is received for a protected method.
 //!
 //! ## Protected Methods
 //!
@@ -33,10 +32,10 @@
 //! ## Performance Considerations
 //!
 //! This middleware adds a CSRF cookie to every request and looks for a
-//! match CSRF token when processing a request for a protected method.
-//! The CSRF token can be returned in an HTTP header, the URL query
-//! string, or an `application/x-www-form-urlencoded` form body. The
-//! token is searched for in that order and the search will be
+//! matching CSRF token when processing a request for a protected
+//! method. The CSRF token can be returned in an HTTP header, the URL
+//! query string, or an `application/x-www-form-urlencoded` form body.
+//! The token is searched for in that order and the search will be
 //! terminated as soon as the token is found.
 //!
 //! The most efficient place to search for the token is in an HTTP
@@ -46,13 +45,15 @@
 //!
 //! Using form fields is the least efficient way to return the CSRF
 //! token because the middleware has to read and deserialize the entire
-//! request body in order to see if the token is present. This is
-//! particularly unfortunate in Tide, which otherwise treats all bodies
-//! as streaming bodies instead of fully-materialized byte arrays.
+//! request body in order to see if the token is present, and then make
+//! a full, in-memory copy of the body available to your application.
+//! Tide request bodies are normally streamed to the application, so
+//! performing this extra deserialization and memory copy step is quite
+//! expensive relative to the normal request flow.
 //!
 //! For this reason, the middleware searches the form fields last *and*
 //! only considers `application/x-www-form-urlencoded` requests;
-//! `multipart/form-data` bodies, which may contain large, binary
+//! `multipart/form-data` bodies, which may contain large binary
 //! payloads, are *not* searched. If you need to protect
 //! `multipart/form-data` requests then you should return the CSRF token
 //! in an HTTP header or the query string.
