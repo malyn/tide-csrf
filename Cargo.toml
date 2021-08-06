@@ -23,3 +23,6 @@ async-std = { version = "1.9.0", features = ["attributes"] }
 serde = { version = "1.0.126", features = ["derive"] }
 tide = "0.16.0"
 tide-testing = "0.1"
+
+[patch.crates-io]
+csrf = { git = "https://github.com/malyn/rust-csrf", branch = "update-aes-dependencies" }
