@@ -28,7 +28,14 @@ Add this to your `Cargo.toml`:
 ```toml
 [dependencies]
 tide-csrf = "0.1"
+
+[patch.crates-io]
+csrf = { git = "https://github.com/malyn/rust-csrf", branch = "update-aes-dependencies" }
 ```
+
+The `[patch]` section is required because of a recent de-listing of the
+`aesni` crate (now part of the `aes` crate), which breaks a transient
+dependency used in `tide-csrf`.
 
 ## Example
 
