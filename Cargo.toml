@@ -9,6 +9,7 @@ edition = "2018"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/malyn/tide-csrf"
+exclude = [ ".editorconfig", ".gitattributes", ".github", ".gitignore" ]
 
 [dependencies]
 csrf = "0.4.0"
