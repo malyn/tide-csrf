@@ -1,6 +1,6 @@
 [package]
 name = "tide-csrf"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Michael Alyn Miller <malyn@strangeGizmo.com>"]
 description = "Cross-Site Request Forgery (CSRF) protection middleware for Tide"
 keywords = ["tide", "csrf", "security"]
@@ -12,7 +12,7 @@ repository = "https://github.com/malyn/tide-csrf"
 exclude = [ ".editorconfig", ".gitattributes", ".github", ".gitignore" ]
 
 [dependencies]
-csrf = "0.4.0"
+csrf = "0.4.1"
 data-encoding = "2.0.0"
 hkdf = "0.11.0"
 serde_urlencoded = "0.7"
@@ -24,6 +24,3 @@ async-std = { version = "1.9.0", features = ["attributes"] }
 serde = { version = "1.0.126", features = ["derive"] }
 tide = "0.16.0"
 tide-testing = "0.1"
-
-[patch.crates-io]
-csrf = { git = "https://github.com/malyn/rust-csrf", branch = "update-aes-dependencies" }
